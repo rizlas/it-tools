@@ -1,0 +1,81 @@
+name: Build image
+
+# Ricostruisce l'immagine su ghcr.io quando cambia il sorgente o la base
+# nginx:stable-alpine (patch di sicurezza nginx), dato che upstream non pubblica più.
+on:
+  schedule:
+    - cron: "37 4 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if source and base image are unchanged"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/it-tools
+  BASE: nginx:stable-alpine
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve base digest and check last build
+        id: check
+        run: |
+          base=$(docker buildx imagetools inspect "$BASE" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          labels=$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Image.Config.Labels}}' 2>/dev/null || echo '{}')
+          old_base=$(echo "$labels" | jq -r '."org.opencontainers.image.base.digest" // empty')
+          old_rev=$(echo "$labels" | jq -r '."org.opencontainers.image.revision" // empty')
+          echo "base: $old_base -> $base, revision: $old_rev -> $GITHUB_SHA"
+          if [ "${{ inputs.force }}" != "true" ] && [ "$old_base" = "$base" ] && [ "$old_rev" = "$GITHUB_SHA" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "date=$(date -u +%Y.%m.%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.skip == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.check.outputs.skip == 'false'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        if: steps.check.outputs.skip == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          pull: true
+          push: true
+          build-args: |
+            BASE_IMAGE=${{ env.BASE }}@${{ steps.check.outputs.base }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.base.name=${{ env.BASE }}
+            org.opencontainers.image.base.digest=${{ steps.check.outputs.base }}
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ steps.check.outputs.date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
